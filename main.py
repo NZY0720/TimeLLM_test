@@ -252,7 +252,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     # 训练模型
-    num_epochs = 10
+    num_epochs = 20
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
