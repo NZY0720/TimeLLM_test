@@ -1,15 +1,14 @@
 import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
 from transformers import GPT2Config, GPT2Model, GPT2Tokenizer
 import transformers
 import math
 import os
-import numpy as np
 
 transformers.logging.set_verbosity_error()
 
@@ -57,7 +56,7 @@ class ReprogrammingLayer(nn.Module):
 
 # 定义 TimeLLM 模型
 class TimeLLM(nn.Module):
-    def __init__(self, seq_len, pred_len, num_features, llm_model='GPT2', llm_dim=768, patch_len=16, stride=8, dropout=0.1, llm_layers=6):
+    def __init__(self, seq_len, pred_len, num_features, llm_model='GPT2', llm_dim=768, patch_len=16, stride=8, dropout=0.2, llm_layers=4):
         super(TimeLLM, self).__init__()
 
         # 时间序列参数
@@ -85,7 +84,7 @@ class TimeLLM(nn.Module):
             else:
                 self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
                 self.tokenizer.pad_token = '[PAD]'
-                self.llm_model.resize_token_embeddings(len(self.tokenizer))
+            self.llm_model.resize_token_embeddings(len(self.tokenizer))
 
         # 冻结 LLM 参数
         for param in self.llm_model.parameters():
@@ -162,6 +161,7 @@ class TimeLLM(nn.Module):
         x_emb = x.permute(0, 2, 1)  # (batch_size, num_features, seq_len)
         x_emb = self.patch_embedding(x_emb)  # (batch_size, llm_dim, num_patches)
         x_emb = x_emb.permute(0, 2, 1)  # (batch_size, num_patches, llm_dim)
+        x_emb = self.dropout(x_emb)  # 添加 Dropout 层
 
         # 将提示转换为嵌入
         tokenized_prompt = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).input_ids.to(device)
@@ -182,14 +182,14 @@ class TimeLLM(nn.Module):
 
         # 将 LLM 输出映射到目标维度
         llm_output = self.mapping_layer(llm_output[:, -x_reprogrammed.shape[1]:])  # 仅取与序列相关的部分
+        llm_output = self.dropout(llm_output)  # 添加 Dropout 层
 
         # 输出投影
         output = self.output_layer(llm_output.mean(dim=1))  # 在补丁上聚合
-        output = self.dropout(output)
 
         return output
 
-# 定义数据集类
+# 修改后的数据集类，返回 idx
 class TimeSeriesDataset(Dataset):
     def __init__(self, data, seq_len, pred_len):
         """
@@ -228,28 +228,41 @@ def main():
     scaler = MinMaxScaler()
     data = scaler.fit_transform(df.values)  # 将数据归一化到 [0, 1]
 
-    # 将数据分为训练集和测试集
-    train_data, test_data = train_test_split(data, test_size=0.2, shuffle=False)
-
     # 定义序列长度和预测长度
     seq_len = 48
     pred_len = 16
 
-    # 创建数据集和数据加载器
-    train_dataset = TimeSeriesDataset(train_data, seq_len, pred_len)
-    test_dataset = TimeSeriesDataset(test_data, seq_len, pred_len)
+    # 创建数据集
+    dataset = TimeSeriesDataset(data, seq_len, pred_len)
 
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    # 划分训练集、验证集和测试集
+    test_size = int(len(dataset) * 0.2)
+    val_size = int(len(dataset) * 0.1)
+    train_size = len(dataset) - test_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size], generator=torch.Generator().manual_seed(42))
+
+    # 创建数据加载器
+    batch_size = 16
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # 初始化模型，使用本地的 GPT-2 模型
-    num_features = train_data.shape[1]  # 获取特征维度
-    model = TimeLLM(seq_len=seq_len, pred_len=pred_len, num_features=num_features, llm_model='GPT2')
+    num_features = data.shape[1]  # 获取特征维度
+    model = TimeLLM(seq_len=seq_len, pred_len=pred_len, num_features=num_features, llm_model='GPT2', llm_dim=768, llm_layers=4, dropout=0.2)
     model.to(device)  # 将模型移动到设备
 
     # 定义损失函数和优化器
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)  # 添加权重衰减
+
+    # 学习率调度器
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+
+    # 早停机制
+    best_val_loss = float('inf')
+    patience = 5
+    trigger_times = 0
 
     # 训练模型
     num_epochs = 20
@@ -264,14 +277,45 @@ def main():
             loss.backward()  # 反向传播
             optimizer.step()  # 更新权重
             train_loss += loss.item()
-        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss / len(train_loader):.4f}")
+        train_loss /= len(train_loader)
+
+        # 验证模型
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for x, y, _ in val_loader:
+                x, y = x.to(device), y.to(device)
+                preds = model(x)
+                loss = criterion(preds, y)
+                val_loss += loss.item()
+        val_loss /= len(val_loader)
+
+        # 学习率调度器
+        scheduler.step(val_loss)
+
+        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+        # 早停机制
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            trigger_times = 0
+            # 保存模型
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            trigger_times += 1
+            if trigger_times >= patience:
+                print("Early stopping!")
+                break
+
+    # 加载最佳模型
+    model.load_state_dict(torch.load('best_model.pth'))
 
     # 评估模型并收集预测结果
     model.eval()
     test_loss = 0.0
 
     # 初始化用于存储完整预测和实际值的数组
-    total_length = test_data.shape[0]
+    total_length = len(test_dataset) + seq_len + pred_len - 1
     predicted_values = np.zeros(total_length)
     ground_truth_values = np.zeros(total_length)
     counts = np.zeros(total_length)
@@ -298,7 +342,8 @@ def main():
                         ground_truth_values[position] += gt[j]
                         counts[position] += 1
 
-    print(f"Test Loss: {test_loss / len(test_loader):.4f}")
+    test_loss /= len(test_loader)
+    print(f"Test Loss: {test_loss:.4f}")
 
     # 计算平均预测值和实际值
     valid_positions = counts > 0
