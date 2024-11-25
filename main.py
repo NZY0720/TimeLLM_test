@@ -56,7 +56,7 @@ class ReprogrammingLayer(nn.Module):
 
 # 定义 TimeLLM 模型
 class TimeLLM(nn.Module):
-    def __init__(self, seq_len, pred_len, num_features, llm_model='GPT2', llm_dim=768, patch_len=16, stride=8, dropout=0.2, llm_layers=4):
+    def __init__(self, seq_len, pred_len, num_features, llm_model='GPT2', llm_dim=768, patch_len=16, stride=8, dropout=0.3, llm_layers=4):
         super(TimeLLM, self).__init__()
 
         # 时间序列参数
@@ -79,12 +79,11 @@ class TimeLLM(nn.Module):
 
         # 确保设置了 pad_token
         if self.tokenizer.pad_token is None:
-            if self.tokenizer.eos_token:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            else:
-                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-                self.tokenizer.pad_token = '[PAD]'
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.tokenizer.pad_token = '[PAD]'
             self.llm_model.resize_token_embeddings(len(self.tokenizer))
+
+        print(f"Pad token: {self.tokenizer.pad_token}, ID: {self.tokenizer.pad_token_id}")
 
         # 冻结 LLM 参数
         for param in self.llm_model.parameters():
@@ -249,23 +248,23 @@ def main():
 
     # 初始化模型，使用本地的 GPT-2 模型
     num_features = data.shape[1]  # 获取特征维度
-    model = TimeLLM(seq_len=seq_len, pred_len=pred_len, num_features=num_features, llm_model='GPT2', llm_dim=768, llm_layers=4, dropout=0.2)
+    model = TimeLLM(seq_len=seq_len, pred_len=pred_len, num_features=num_features, llm_model='GPT2', llm_dim=768, llm_layers=4, dropout=0.3)
     model.to(device)  # 将模型移动到设备
 
     # 定义损失函数和优化器
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)  # 添加权重衰减
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)  # 降低学习率
 
     # 学习率调度器
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
 
     # 早停机制
     best_val_loss = float('inf')
-    patience = 5
+    patience = 10  # 增加 patience
     trigger_times = 0
 
     # 训练模型
-    num_epochs = 20
+    num_epochs = 100  # 增加训练轮次
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
@@ -275,6 +274,7 @@ def main():
             preds = model(x)  # 前向传播
             loss = criterion(preds, y)  # 计算损失
             loss.backward()  # 反向传播
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪
             optimizer.step()  # 更新权重
             train_loss += loss.item()
         train_loss /= len(train_loader)
@@ -361,6 +361,15 @@ def main():
     plt.title("Predictions vs Ground Truth on Test Set")
     plt.savefig('prediction_plot_full_series.png')
     plt.show()
+
+    # 保存预测值和实际值为 CSV 文件
+    output_data = pd.DataFrame({
+        'Position': positions[valid_positions],
+        'Ground Truth': ground_truth_values[valid_positions],
+        'Predictions': predicted_values[valid_positions]
+    })
+    output_data.to_csv('prediction_results.csv', index=False)
+    print("预测结果已保存到 prediction_results.csv")
 
 # 运行主函数
 if __name__ == "__main__":
